@@ -349,6 +349,11 @@ loop:
 	// Additional, consensus type-dependent initialization goes here
 	// Also using this to panic on unknown orderer type.
 	switch ord.OrdererType {
+
+	case "skeen":
+		// Skeen não exige configurações extras no genesis configtx.yaml no momento.
+		// Apenas permitimos que ele passe pela validação.
+
 	case "solo":
 		// nothing to be done here
 	case EtcdRaft:
@@ -453,9 +458,11 @@ loop:
 			cf.TranslatePathInPlace(configDir, &c.ServerTLSCert)
 			cf.TranslatePathInPlace(configDir, &c.Identity)
 		}
+
 	default:
 		logger.Panicf("unknown orderer type: %s", ord.OrdererType)
 	}
+
 }
 
 func translatePaths(configDir string, org *Organization) {

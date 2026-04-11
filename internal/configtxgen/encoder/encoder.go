@@ -228,6 +228,8 @@ func NewOrdererGroup(conf *genesisconfig.Orderer, channelCapabilities map[string
 		conf.SmartBFT.LeaderRotation = smartbft.Options_ROTATION_OFF
 		// Overwrite policy manually by computing it from the consenters
 		policies.EncodeBFTBlockVerificationPolicy(consenterProtos, ordererGroup)
+	case "skeen":
+		// O Skeen não precisa injetar metadados extras no Bloco Genesis no momento.
 	default:
 		return nil, errors.Errorf("unknown orderer type: %s", conf.OrdererType)
 	}

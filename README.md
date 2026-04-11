@@ -54,3 +54,13 @@ Engage with the Hyperledger community:
 
 Hyperledger Fabric source code is available under the **Apache License, Version 2.0 (Apache-2.0)**, and documentation files are under the **Creative Commons Attribution 4.0 International License (CC-BY-4.0)**.
 # skeen-hyper
+
+### Fase 6: Compatibilidade com Fabric v3.x e Injeção Dinâmica de Canais
+
+Com a evolução da arquitetura do Hyperledger Fabric para a versão 3.x, o conceito de "System Channel" (Bloco Gênesis do Sistema) foi descontinuado. Agora, os nós de ordenação (Orderers) nascem "vazios" e os canais são injetados dinamicamente em tempo de execução via API de participação (`osnadmin`).
+
+Para tornar o protocolo Skeen compatível com esta nova arquitetura de ponta:
+1. **Implementação do ClusterConsenter:** O motor do Skeen (`skeen.go`) foi atualizado para satisfazer a interface `ClusterConsenter` exigida pelo Fabric v3.
+2. **Validação de Membro (`IsChannelMember`):** Implementamos a função de validação que autoriza o ingresso do nó no canal quando o comando de *join* é recebido.
+3. **Injeção a Quente:** O bloco gênesis do `canal1` foi gerado independentemente e injetado no Orderer ativo utilizando a ferramenta `osnadmin` e certificados TLS.
+4. **Sucesso:** O Fabric validou a permissão criptográfica e invocou com sucesso a função `HandleChain`, instanciando o relógio de Lamport e a fila pendente do Skeen em background.
