@@ -1,8 +1,11 @@
 package skeen
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
-	"sort" // NOVO: Para ordenar a fila pelo TS_Final
+	"net/http"
+	"sort"
 	"sync"
 
 	"github.com/hyperledger/fabric-protos-go-apiv2/common"
@@ -32,30 +35,21 @@ type chain struct {
 }
 
 func (c *chain) Order(env *common.Envelope, configSeq uint64) error {
-	// 1. Extração do ID (Pode ser feito sem travar a memória)
 	payload, err := protoutil.UnmarshalPayload(env.Payload)
-	if err != nil {
-		return fmt.Errorf("SKEEN: erro ao abrir payload: %v", err)
-	}
+	if err != nil { return fmt.Errorf("SKEEN: erro ao abrir payload: %v", err) }
 
 	chdr, err := protoutil.UnmarshalChannelHeader(payload.Header.ChannelHeader)
-	if err != nil {
-		return fmt.Errorf("SKEEN: erro ao abrir cabeçalho: %v", err)
-	}
+	if err != nil { return fmt.Errorf("SKEEN: erro cabeçalho: %v", err) }
 
 	txID := chdr.TxId
-	if txID == "" {
-		txID = "TX_SISTEMA_INTERNO"
-	}
+	if txID == "" { txID = "TX_SISTEMA_INTERNO" }
 
-	// 2. Incremento do Relógio e Fila
 	c.mutex.Lock()
 	c.lamportClock++
 	meuTSLocal := c.lamportClock
 
-	// NOVO: Inicializamos a transação com o mapa de ReceivedTS
 	c.pendingQueue[txID] = &PendingTx{
-		TxID:       txID, // NOVO
+		TxID:       txID,
 		Envelope:   env,
 		TSLocal:    meuTSLocal,
 		IsFinal:    false,
@@ -64,17 +58,38 @@ func (c *chain) Order(env *common.Envelope, configSeq uint64) error {
 	fmt.Printf("[SKEEN Canal %s] Tx [%s] recebida. TS Local: %d\n", c.channelID, txID, meuTSLocal)
 	c.mutex.Unlock()
 
-	// 3. O Multicast do Skeen (Conversando com outros canais)
-	// Lemos a lista de canais do Roteador Global (RLock apenas para leitura)
-	globalRegistry.mutex.RLock()
-	for id, otherChain := range globalRegistry.chains {
-		// Não manda mensagem para si mesmo
-		if id != c.channelID {
-			// Dispara uma 'Goroutine' (thread em 2º plano) para simular o envio pela rede!
-			go otherChain.ReceiveMulticast(txID, c.channelID, meuTSLocal)
-		}
+	// === NOVO: DISPARO DE MULTICAST VIA REDE HTTP ===
+	// === NOVO: O COORDENADOR COLETANDO OS VOTOS (Multicast Skeen) ===
+	msg := MulticastMsg{
+		TxID:          txID,
+		SenderNode:    "Coordinator",
+		SenderTSLocal: meuTSLocal,
 	}
-	globalRegistry.mutex.RUnlock()
+	payloadJSON, _ := json.Marshal(msg)
+
+	peers := []string{
+		"http://127.0.0.1:17050", // Nó 1 (ele vota também)
+		"http://127.0.0.1:18050", // Nó 2
+		"http://127.0.0.1:19050", // Nó 3
+		"http://127.0.0.1:20050", // Nó 4
+	}
+
+	for i, peer := range peers {
+		nodeName := fmt.Sprintf("Orderer-%d", i+1)
+		// Dispara requisições e espera as respostas JSON
+		go func(url string, name string) {
+			resp, err := http.Post(url+"/skeen/multicast", "application/json", bytes.NewBuffer(payloadJSON))
+			if err == nil {
+				defer resp.Body.Close()
+				var result map[string]uint64
+				json.NewDecoder(resp.Body).Decode(&result)
+				
+				// Recebeu o voto do nó remoto! Entrega pra caixa de correio
+				remoteTS := result["ts"]
+				c.ReceiveMulticast(txID, name, remoteTS)
+			}
+		}(peer, nodeName)
+	}
 
 	return nil
 }
@@ -106,58 +121,58 @@ func (c *chain) ReceiveMulticast(txID string, senderChannel string, senderTSLoca
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 
-	// 1. Atualiza o relógio lógico de Lamport (regra do MAX)
-	if senderTSLocal > c.lamportClock {
-		c.lamportClock = senderTSLocal
-	}
-
-	// 2. Busca a transação na nossa fila
 	tx, exists := c.pendingQueue[txID]
-	if !exists {
-		// Em um sistema real, a rede pode ter atrasos. Se a Tx chegou via multicast antes
-		// do cliente enviá-la para nós, deveríamos colocar num buffer de espera.
-		// Para o protótipo, vamos apenas registrar o aviso.
-		return
-	}
+	if !exists { return } // Ignora se não for o Coordenador
 
-	// 3. Guarda o Timestamp que o outro canal nos enviou
+	// Guarda o voto usando o nome real do Orderer para não sobrescrever!
 	tx.ReceivedTS[senderChannel] = senderTSLocal
-	fmt.Printf("[SKEEN Canal %s] Multicast anotado: Canal %s enviou TS %d para Tx [%s]\n", c.channelID, senderChannel, senderTSLocal, txID)
+	fmt.Printf("[SKEEN Canal %s] Voto recebido: %s respondeu com TS %d para Tx [%s]\n", c.channelID, senderChannel, senderTSLocal, txID)
 
-	// 4. Tenta ver se já temos votos suficientes para decidir o TS_Final
 	c.tryFinalizeTx(txID, tx)
 }
 
 // tryFinalizeTx verifica se todos os canais já responderam
 // NOTA: Esta função assume que c.mutex já está travado pela função que a chamou!
-func (c *chain) tryFinalizeTx(txID string, tx *PendingTx) {
-	// Quantos canais existem na rede inteira?
-	globalRegistry.mutex.RLock()
-	totalChannels := len(globalRegistry.chains)
-	globalRegistry.mutex.RUnlock()
+// tryFinalizeTx verifica se todos os canais já responderam
+func (c *chain) tryFinalizeTx(txID string, tx *SkeenTransaction) {
+	if len(tx.ReceivedTS) < 4 { return } // Espera os 4 votos
 
-	// O total de respostas é o nosso próprio TS (1) + os que estão no mapa
-	totalRespostas := len(tx.ReceivedTS) + 1
-
-	if totalRespostas >= totalChannels {
-		// Chegaram todos! Vamos aplicar a matemática do Skeen (TS_Final = MAX de todos os TS)
-		maxTS := tx.TSLocal
-		for _, ts := range tx.ReceivedTS {
-			if ts > maxTS {
-				maxTS = ts
-			}
-		}
-
-		// Grava a decisão final
-		tx.TSFinal = maxTS
-		tx.IsFinal = true
-		fmt.Printf("[SKEEN Canal %s] === CONSENSO ATINGIDO === Tx [%s] cravada com TS Final: %d\n", c.channelID, txID, maxTS)
-
-		// NOVO: Chama a fila para processar, ordenar e gerar os blocos!
-		c.processQueue()
-
-		// TODO (Fase 5): Reordenar a c.pendingQueue baseada no TSFinal e enviar ao BlockCutter!
+	// 1. Calcula o TS Máximo
+	var maxTS uint64
+	for _, ts := range tx.ReceivedTS {
+		if ts > maxTS { maxTS = ts }
 	}
+
+	fmt.Printf("\n======================================================\n")
+	fmt.Printf("🏆 [COORDENADOR] CONSENSO ATINGIDO: %s | TS Final: %d\n", txID, maxTS)
+	fmt.Printf("======================================================\n")
+
+	// 2. Notifica todos os nós (inclusive ele mesmo) via Commit
+	peers := []string{"http://127.0.0.1:17050", "http://127.0.0.1:18050", "http://127.0.0.1:19050", "http://127.0.0.1:20050"}
+	commitData, _ := json.Marshal(map[string]interface{}{
+		"tx_id":    txID,
+		"final_ts": maxTS,
+	})
+
+	for _, url := range peers {
+		go http.Post(url+"/skeen/commit", "application/json", bytes.NewBuffer(commitData))
+	}
+}
+
+// Nova função que será chamada pelo Commit em todos os nós
+func (c *chain) FinalizeAndDeliver(txID string, finalTS uint64) {
+	c.mutex.Lock()
+	tx, exists := c.pendingQueue[txID]
+	if !exists { 
+		c.mutex.Unlock()
+		return 
+	}
+	delete(c.pendingQueue, txID)
+	c.mutex.Unlock()
+
+	// Agora SIM todos os nós chamam o corte do bloco
+	fmt.Printf("[SKEEN] Entregando Tx [%s] ao Ledger Local via BlockCutter\n", txID)
+	c.support.WriteConfigBlock(tx.Envelope, nil) // Ou a chamada correta do seu logger
 }
 
 // processQueue varre a fila, ordena pelo TS_Final e cria os blocos
