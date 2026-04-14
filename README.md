@@ -64,3 +64,12 @@ Para tornar o protocolo Skeen compatível com esta nova arquitetura de ponta:
 2. **Validação de Membro (`IsChannelMember`):** Implementamos a função de validação que autoriza o ingresso do nó no canal quando o comando de *join* é recebido.
 3. **Injeção a Quente:** O bloco gênesis do `canal1` foi gerado independentemente e injetado no Orderer ativo utilizando a ferramenta `osnadmin` e certificados TLS.
 4. **Sucesso:** O Fabric validou a permissão criptográfica e invocou com sucesso a função `HandleChain`, instanciando o relógio de Lamport e a fila pendente do Skeen em background.
+
+
+### Fase 7: Gerador de Carga Criptográfica e Validação SigFilter
+
+Para testar o motor Skeen de forma isolada, sem a necessidade de instanciar a infraestrutura completa de Peers do Fabric, construímos um Injetor de Carga nativo em Go (`cliente-skeen`).
+* **Bypass de Segurança:** O script foi programado para superar a barreira do `SigFilter` do Fabric (que rejeita pacotes anônimos).
+* **Assinatura ECDSA:** O Injetor utiliza os certificados X.509 do Administrador da Org1 para gerar o Hash SHA-256 do payload e assinar a transação digitalmente usando a curva elíptica.
+* **Comunicação gRPC:** O pacote blindado é enviado diretamente para a porta 7050 via TLS.
+* **Resultado:** O nó Skeen interceptou a transação com sucesso, instanciou a fila pendente e cravou o Relógio de Lamport (`TS = 1`), comprovando a recepção e o roteamento correto no Fabric v3.x.
