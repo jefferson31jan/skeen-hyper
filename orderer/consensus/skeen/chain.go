@@ -36,13 +36,19 @@ type chain struct {
 
 func (c *chain) Order(env *common.Envelope, configSeq uint64) error {
 	payload, err := protoutil.UnmarshalPayload(env.Payload)
-	if err != nil { return fmt.Errorf("SKEEN: erro ao abrir payload: %v", err) }
+	if err != nil {
+		return fmt.Errorf("SKEEN: erro ao abrir payload: %v", err)
+	}
 
 	chdr, err := protoutil.UnmarshalChannelHeader(payload.Header.ChannelHeader)
-	if err != nil { return fmt.Errorf("SKEEN: erro cabeçalho: %v", err) }
+	if err != nil {
+		return fmt.Errorf("SKEEN: erro cabeçalho: %v", err)
+	}
 
 	txID := chdr.TxId
-	if txID == "" { txID = "TX_SISTEMA_INTERNO" }
+	if txID == "" {
+		txID = "TX_SISTEMA_INTERNO"
+	}
 
 	c.mutex.Lock()
 	c.lamportClock++
@@ -83,7 +89,7 @@ func (c *chain) Order(env *common.Envelope, configSeq uint64) error {
 				defer resp.Body.Close()
 				var result map[string]uint64
 				json.NewDecoder(resp.Body).Decode(&result)
-				
+
 				// Recebeu o voto do nó remoto! Entrega pra caixa de correio
 				remoteTS := result["ts"]
 				c.ReceiveMulticast(txID, name, remoteTS)
@@ -122,7 +128,9 @@ func (c *chain) ReceiveMulticast(txID string, senderChannel string, senderTSLoca
 	defer c.mutex.Unlock()
 
 	tx, exists := c.pendingQueue[txID]
-	if !exists { return } // Ignora se não for o Coordenador
+	if !exists {
+		return
+	} // Ignora se não for o Coordenador
 
 	// Guarda o voto usando o nome real do Orderer para não sobrescrever!
 	tx.ReceivedTS[senderChannel] = senderTSLocal
@@ -134,18 +142,38 @@ func (c *chain) ReceiveMulticast(txID string, senderChannel string, senderTSLoca
 // tryFinalizeTx verifica se todos os canais já responderam
 // NOTA: Esta função assume que c.mutex já está travado pela função que a chamou!
 // tryFinalizeTx verifica se todos os canais já responderam
-func (c *chain) tryFinalizeTx(txID string, tx *SkeenTransaction) {
-	if len(tx.ReceivedTS) < 4 { return } // Espera os 4 votos
+func (c *chain) tryFinalizeTx(txID string, tx *PendingTx) {
+	if len(tx.ReceivedTS) < 4 {
+		return
+	} // Espera os 4 votos
 
 	// 1. Calcula o TS Máximo
 	var maxTS uint64
 	for _, ts := range tx.ReceivedTS {
-		if ts > maxTS { maxTS = ts }
+		if ts > maxTS {
+			maxTS = ts
+		}
 	}
 
 	fmt.Printf("\n======================================================\n")
 	fmt.Printf("🏆 [COORDENADOR] CONSENSO ATINGIDO: %s | TS Final: %d\n", txID, maxTS)
 	fmt.Printf("======================================================\n")
+
+	// ====================================================================
+	// A PONTE ENTRE O SKEEN E O FABRIC (GRAVAÇÃO NO DISCO)
+	// ====================================================================
+
+	// ====================================================================
+	// A PONTE ENTRE O SKEEN E O FABRIC (GRAVAÇÃO NO DISCO)
+	// ====================================================================
+
+	// 1. Pedimos ao Fabric para empacotar a transação em um Bloco oficial
+	blocoSkeen := c.support.CreateNextBlock([]*common.Envelope{tx.Envelope})
+
+	// 2. Mandamos o Fabric gravar o bloco fisicamente no Ledger (SSD)
+	c.support.WriteBlock(blocoSkeen, nil)
+
+	fmt.Printf("[SKEEN] *** BLOCO GERADO E GRAVADO COM SUCESSO NO LEDGER! ***\n")
 
 	// 2. Notifica todos os nós (inclusive ele mesmo) via Commit
 	peers := []string{"http://127.0.0.1:17050", "http://127.0.0.1:18050", "http://127.0.0.1:19050", "http://127.0.0.1:20050"}
@@ -163,16 +191,25 @@ func (c *chain) tryFinalizeTx(txID string, tx *SkeenTransaction) {
 func (c *chain) FinalizeAndDeliver(txID string, finalTS uint64) {
 	c.mutex.Lock()
 	tx, exists := c.pendingQueue[txID]
-	if !exists { 
+	if !exists {
 		c.mutex.Unlock()
-		return 
+		return
 	}
 	delete(c.pendingQueue, txID)
 	c.mutex.Unlock()
 
 	// Agora SIM todos os nós chamam o corte do bloco
 	fmt.Printf("[SKEEN] Entregando Tx [%s] ao Ledger Local via BlockCutter\n", txID)
-	c.support.WriteConfigBlock(tx.Envelope, nil) // Ou a chamada correta do seu logger
+	// c.support.WriteConfigBlock(tx.Envelope, nil) // Ou a chamada correta do seu logger
+
+	// 1. Criamos um novo bloco contendo apenas a nossa transação Skeen
+	blocoSkeen := c.support.CreateNextBlock([]*common.Envelope{tx.Envelope})
+
+	// 2. Gravamos o bloco fisicamente no Ledger (disco)
+	c.support.WriteBlock(blocoSkeen, nil)
+
+	fmt.Printf("\n[SKEEN Canal %s] *** NOVO BLOCO GRAVADO COM SUCESSO! ***\n", c.channelID)
+
 }
 
 // processQueue varre a fila, ordena pelo TS_Final e cria os blocos
