@@ -266,7 +266,9 @@ func (c *chain) FinalizeAndDeliver(txID string, finalTS uint64) {
 	blocoSkeen := c.support.CreateNextBlock([]*common.Envelope{tx.Envelope})
 	c.support.WriteBlock(blocoSkeen, nil)
 
-	fmt.Printf("[SKEEN Canal %s] *** BLOCO GERADO E GRAVADO COM SUCESSO NO LEDGER! ***\n", c.channelID)
+	// fmt.Printf("[SKEEN Canal %s] *** BLOCO GERADO E GRAVADO COM SUCESSO NO LEDGER! ***\n", c.channelID)
+	// logger.Infof("[SKEEN Canal %s] *** BLOCO [%d] GERADO E GRAVADO COM SUCESSO! ***", channelID, block.Header.Number)
+	fmt.Printf("[SKEEN Canal %s] *** BLOCO [%d] GERADO E GRAVADO COM SUCESSO NO LEDGER! ***\n", c.channelID, blocoSkeen.Header.Number)
 }
 
 func (c *chain) processQueue() {
