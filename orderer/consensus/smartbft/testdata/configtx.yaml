@@ -119,7 +119,7 @@ Organizations:
 #
 #   SECTION: Capabilities
 #
-#   - This section defines the capabilities of fabric network. This is a new
+#   - This section defines the capabilities of fabric network. This is a newf
 #   concept as of v1.1.0 and should not be utilized in mixed networks with
 #   v1.0.x peers and orderers.  Capabilities define features which must be
 #   present in a fabric binary for that binary to safely participate in the
