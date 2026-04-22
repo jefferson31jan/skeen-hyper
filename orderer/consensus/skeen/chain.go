@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net/http"
 	"os"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -111,7 +110,7 @@ func (c *chain) Order(env *common.Envelope, configSeq uint64) error {
 		txID = "INTERNAL_TX"
 	}
 
-	// 1. LÊ O ROTEAMENTO DO CLIENTE NO TxID (Ex: CROSS_canal1-canal3_BENCH_...)
+	// 1. LÊ O ROTEAMENTO DO CLIENTE NO TxID (Ex: CROSS_canal3-canal1_BENCH_...)
 	crossChans := []string{c.channelID}
 	if strings.HasPrefix(txID, "CROSS_") {
 		partes := strings.Split(txID, "_")
@@ -119,8 +118,9 @@ func (c *chain) Order(env *common.Envelope, configSeq uint64) error {
 			crossChans = strings.Split(partes[1], "-")
 		}
 	}
-	// Garante que a lista está sempre ordenada matematicamente
-	sort.Strings(crossChans)
+
+	// 🚨 REMOVIDO: sort.Strings(crossChans)
+	// Agora o Orderer respeita a ordem aleatória enviada pelo cliente!
 
 	c.mutex.Lock()
 	// 2. PROTEÇÃO DE IDEMPOTÊNCIA E SPLIT-BRAIN
@@ -145,7 +145,8 @@ func (c *chain) Order(env *common.Envelope, configSeq uint64) error {
 	}
 	c.mutex.Unlock()
 
-	// 4. A REGRA DO MENOR ID: O primeiro da lista alfabética é o Coordenador
+	// 4. LÍDER DINÂMICO (LOAD BALANCING): O primeiro canal da string é o Coordenador
+	// Ex: Se o TxID for "CROSS_canal3-canal1...", o canal3 assume como coordenador.
 	isCoordinator := (len(crossChans) > 0 && crossChans[0] == c.channelID)
 
 	var role string
