@@ -110,7 +110,6 @@ func (c *chain) Order(env *common.Envelope, configSeq uint64) error {
 		txID = "INTERNAL_TX"
 	}
 
-	// 1. LÊ O ROTEAMENTO DO CLIENTE NO TxID (Ex: CROSS_canal3-canal1_BENCH_...)
 	crossChans := []string{c.channelID}
 	if strings.HasPrefix(txID, "CROSS_") {
 		partes := strings.Split(txID, "_")
@@ -120,7 +119,6 @@ func (c *chain) Order(env *common.Envelope, configSeq uint64) error {
 	}
 
 	c.mutex.Lock()
-	// 2. PROTEÇÃO DE IDEMPOTÊNCIA E SPLIT-BRAIN
 	if _, exists := c.pendingQueue[txID]; exists {
 		c.mutex.Unlock()
 		return nil
@@ -130,7 +128,6 @@ func (c *chain) Order(env *common.Envelope, configSeq uint64) error {
 		return nil
 	}
 
-	// 3. GERAÇÃO DO RELÓGIO LÓGICO
 	c.lamportClock++
 	meuTSLocal := c.lamportClock
 
@@ -142,40 +139,29 @@ func (c *chain) Order(env *common.Envelope, configSeq uint64) error {
 	}
 	c.mutex.Unlock()
 
-	// 4. LÍDER DINÂMICO (LOAD BALANCING): O primeiro canal da string é o Coordenador
-	isCoordinator := (len(crossChans) > 0 && crossChans[0] == c.channelID)
+	// 🚨 ALGORITMO 1: TODOS SÃO PEERS, NÃO EXISTE COORDENADOR
+	fmt.Printf("[SKEEN Canal %s] Tx [%s] recebida. TS: %d | Papel: PEER (All-to-All)\n", c.channelID, txID, meuTSLocal)
 
-	var role string
-	if isCoordinator {
-		role = "COORDENADOR"
-	} else {
-		role = "SEGUIDOR"
-	}
-	fmt.Printf("[SKEEN Canal %s] Tx [%s] recebida. TS: %d | Papel: %s\n", c.channelID, txID, meuTSLocal, role)
-
-	// 5. EXECUÇÃO DO PAPEL
-	if isCoordinator && len(crossChans) > 1 {
-		// O Coordenador vai buscar os relógios dos seguidores de forma assíncrona
+	if len(crossChans) > 1 {
+		// TODOS atiram a Fase 2 de forma paralela
 		go c.tryFinalizeTx(txID, meuTSLocal, crossChans)
-	} else if len(crossChans) == 1 {
-		// Se for Intra-Shard, finaliza e entrega para o BlockCutter imediatamente
+	} else {
+		// Intra-Shard
 		c.FinalizeAndDeliver(txID, meuTSLocal)
 	}
-	// Se for Seguidor em uma transação Cross-Shard, aguarda o /commit via HTTP
 
 	return nil
 }
 
 // ==========================================
-// FASE 2: COORDENAÇÃO E FINALIZAÇÃO
+// FASE 2: COORDENAÇÃO DESCENTRALIZADA (O(N^2))
 // ==========================================
 
 func (c *chain) tryFinalizeTx(txID string, maxTSLocal uint64, crossChannels []string) {
 	finalTS := maxTSLocal
 
 	if len(crossChannels) > 1 {
-		// 🚀 OTIMIZAÇÃO: Sem 'Sleep(30ms)' aqui. Active Polling direto para máxima velocidade.
-
+		// TODOS OS NÓS FAZEM POLLING DE TODOS OS OUTROS
 		for _, outroCanal := range crossChannels {
 			if outroCanal == c.channelID {
 				continue
@@ -189,9 +175,8 @@ func (c *chain) tryFinalizeTx(txID string, maxTSLocal uint64, crossChannels []st
 			url := fmt.Sprintf("http://127.0.0.1:%d/skeen/exchange_ts", port)
 			reqData, _ := json.Marshal(map[string]interface{}{"tx_id": txID, "channel_id": outroCanal})
 
-			fmt.Printf("📡 [FEEDBACK] Coordenador %s solicitando TS do %s via HTTP para Tx [%s]\n", c.channelID, outroCanal, txID)
+			fmt.Printf("📡 [ALL-TO-ALL] Shard %s pedindo TS do %s para Tx [%s]\n", c.channelID, outroCanal, txID)
 
-			// LOOP DE RETRY BLINDADO
 			for i := 0; i < 15; i++ {
 				resp, err := http.Post(url, "application/json", bytes.NewBuffer(reqData))
 				if err == nil {
@@ -201,43 +186,26 @@ func (c *chain) tryFinalizeTx(txID string, maxTSLocal uint64, crossChannels []st
 					}
 					if err := json.NewDecoder(resp.Body).Decode(&result); err == nil {
 						if result.Found {
-							fmt.Printf("📩 [FEEDBACK] Coordenador %s recebeu TS Local: %d do %s para Tx [%s]\n", c.channelID, result.MaxTS, outroCanal, txID)
-
+							fmt.Printf("📩 [ALL-TO-ALL] Shard %s recebeu TS: %d do %s para Tx [%s]\n", c.channelID, result.MaxTS, outroCanal, txID)
 							if result.MaxTS > finalTS {
 								finalTS = result.MaxTS
 							}
 							resp.Body.Close()
-							break // Achou o voto definitivo
+							break
 						}
 					}
 					resp.Body.Close()
 				}
-				// Backoff exponencial suave caso o nó ainda não tenha recebido a transação
 				time.Sleep(time.Duration(20*(i+1)) * time.Millisecond)
 			}
 		}
 	}
 
-	fmt.Printf("🏆 [COORDENADOR Shard %s] CONSENSO ATINGIDO: %s | TS Final: %d\n", c.channelID, txID, finalTS)
+	// Como todos varreram a rede e aplicaram o MAX sobre os mesmos números locais,
+	// a matemática garante que todos chegaram ao mesmo FinalTS.
+	// Não precisamos de /commit. Vamos direto para o disco!
+	fmt.Printf("🔄 [ALL-TO-ALL Shard %s] CONSENSO INDEPENDENTE ATINGIDO: %s | TS Final: %d\n", c.channelID, txID, finalTS)
 
-	// Envia a ordem de COMMIT para os seguidores (com o FinalTS correto!)
-	commitData, _ := json.Marshal(map[string]interface{}{
-		"tx_id": txID, "channel_id": c.channelID, "final_ts": finalTS,
-	})
-
-	fmt.Printf("📢 [FEEDBACK] Coordenador %s enviando ordem de COMMIT Global para os seguidores na Tx [%s]\n", c.channelID, txID)
-
-	for _, ch := range crossChannels {
-		if ch == c.channelID {
-			continue
-		}
-		port := getPortForChannel(ch)
-		if port != 0 {
-			go http.Post(fmt.Sprintf("http://127.0.0.1:%d/skeen/commit", port), "application/json", bytes.NewBuffer(commitData))
-		}
-	}
-
-	// O Coordenador finaliza e entrega a sua própria cópia da transação
 	c.FinalizeAndDeliver(txID, finalTS)
 }
 
@@ -245,7 +213,6 @@ func (c *chain) FinalizeAndDeliver(txID string, finalTS uint64) {
 	c.mutex.Lock()
 
 	// 🚨 CORREÇÃO ALGORITMO 1 (LINHA 16): Sincronização do Relógio de Lamport
-	// Se a rede chegou a um consenso sobre um tempo futuro, este nó é "puxado" para esse tempo.
 	if finalTS > c.lamportClock {
 		c.lamportClock = finalTS
 		fmt.Printf("⏱️ [SYNC] Shard %s adiantou o relógio interno para %d\n", c.channelID, c.lamportClock)
@@ -260,11 +227,8 @@ func (c *chain) FinalizeAndDeliver(txID string, finalTS uint64) {
 	c.localTSHistory[txID] = tx.TSLocal
 	envelopeParaBlockCutter := tx.Envelope
 	delete(c.pendingQueue, txID)
-	c.mutex.Unlock() // Libera a memória rápida do Skeen
+	c.mutex.Unlock()
 
-	// -------------------------------------------------------------
-	// 🚀 ZONA DE EXCLUSÃO MÚTUA DE GRAVAÇÃO (FILA INDIANA PARA O HD)
-	// -------------------------------------------------------------
 	c.blockMutex.Lock()
 	defer c.blockMutex.Unlock()
 
@@ -273,7 +237,6 @@ func (c *chain) FinalizeAndDeliver(txID string, finalTS uint64) {
 	for _, batch := range batches {
 		blocoSkeen := c.support.CreateNextBlock(batch)
 		c.support.WriteBlock(blocoSkeen, nil)
-		// Para reduzir o ruído no terminal com 10.000 TPS, este log final pode ser comentado depois
 		fmt.Printf("[SKEEN Canal %s] 🧱 *** BLOCO [%d] GRAVADO NO DISCO (Lote cheio: %d txs) ***\n", c.channelID, blocoSkeen.Header.Number, len(batch))
 	}
 }
@@ -317,7 +280,7 @@ func startNetworkServer() {
 		}
 
 		if found {
-			fmt.Printf("📨 [FEEDBACK API] Shard %s respondendo solicitação de TS com valor %d para Tx [%s]\n", req.ChannelID, currentTS, req.TxID)
+			fmt.Printf("📨 [FEEDBACK API] Shard %s devolvendo TS %d para quem pediu. Tx [%s]\n", req.ChannelID, currentTS, req.TxID)
 		}
 
 		w.Header().Set("Content-Type", "application/json")
@@ -327,33 +290,11 @@ func startNetworkServer() {
 		})
 	})
 
-	http.HandleFunc("/skeen/commit", func(w http.ResponseWriter, r *http.Request) {
-		var msg struct {
-			TxID      string `json:"tx_id"`
-			ChannelID string `json:"channel_id"`
-			FinalTS   uint64 `json:"final_ts"` // 🚨 LÊ O TIMESTAMP FINAL DO COORDENADOR
-		}
-		json.NewDecoder(r.Body).Decode(&msg)
+	// Rota de /commit completamente removida. O consenso agora é 100% descentralizado.
 
-		fmt.Printf("✅ [FEEDBACK API] Shard(s) local(is) recebendo ordem de COMMIT Global para Tx [%s] com TS Final %d\n", msg.TxID, msg.FinalTS)
-
-		globalRegistry.mutex.RLock()
-		for _, c := range globalRegistry.chains {
-			// 🚨 PASSA O FINALTS REAL PARA QUE O SEGUIDOR POSSA SINCRONIZAR O SEU RELÓGIO
-			c.FinalizeAndDeliver(msg.TxID, msg.FinalTS)
-		}
-		globalRegistry.mutex.RUnlock()
-
-		w.WriteHeader(http.StatusOK)
-	})
-
-	fmt.Printf("[SKEEN NETWORK LAYER] API HTTP ativa na porta: %d\n", skeenPort)
+	fmt.Printf("[SKEEN NETWORK LAYER] API HTTP All-to-All ativa na porta: %d\n", skeenPort)
 	http.ListenAndServe(fmt.Sprintf(":%d", skeenPort), nil)
 }
-
-// ==========================================
-// FUNÇÕES AUXILIARES
-// ==========================================
 
 func getPortForChannel(channelID string) int {
 	switch channelID {
