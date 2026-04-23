@@ -19,6 +19,11 @@ import (
 // ==========================================
 // REGISTROS GLOBAIS E ESTRUTURAS
 // ==========================================
+var (
+	startTime    time.Time
+	txCount      int
+	metricsMutex sync.Mutex
+)
 
 type SkeenRegistry struct {
 	mutex  sync.RWMutex
@@ -72,7 +77,7 @@ type chain struct {
 	channelID string
 
 	mutex          sync.Mutex
-	blockMutex     sync.Mutex // Cadeado exclusivo para gravação no HD
+	blockMutex     sync.Mutex
 	lamportClock   uint64
 	pendingQueue   map[string]*PendingTx
 	localTSHistory map[string]uint64
@@ -95,6 +100,13 @@ func (c *chain) Halt() {
 // ==========================================
 
 func (c *chain) Order(env *common.Envelope, configSeq uint64) error {
+	metricsMutex.Lock()
+	if txCount == 0 {
+		startTime = time.Now() // Marca o início da rajada de testes
+	}
+	txCount++
+	metricsMutex.Unlock()
+
 	payload, err := protoutil.UnmarshalPayload(env.Payload)
 	if err != nil {
 		return err
@@ -118,6 +130,19 @@ func (c *chain) Order(env *common.Envelope, configSeq uint64) error {
 		}
 	}
 
+	// 🚨 FIREWALL DE PROTEÇÃO (EDGE FILTERING) 🚨
+	souParticipante := false
+	for _, ch := range crossChans {
+		if ch == c.channelID {
+			souParticipante = true
+			break
+		}
+	}
+
+	if !souParticipante {
+		return nil
+	}
+
 	c.mutex.Lock()
 	if _, exists := c.pendingQueue[txID]; exists {
 		c.mutex.Unlock()
@@ -139,14 +164,11 @@ func (c *chain) Order(env *common.Envelope, configSeq uint64) error {
 	}
 	c.mutex.Unlock()
 
-	// 🚨 ALGORITMO 1: TODOS SÃO PEERS, NÃO EXISTE COORDENADOR
 	fmt.Printf("[SKEEN Canal %s] Tx [%s] recebida. TS: %d | Papel: PEER (All-to-All)\n", c.channelID, txID, meuTSLocal)
 
 	if len(crossChans) > 1 {
-		// TODOS atiram a Fase 2 de forma paralela
 		go c.tryFinalizeTx(txID, meuTSLocal, crossChans)
 	} else {
-		// Intra-Shard
 		c.FinalizeAndDeliver(txID, meuTSLocal)
 	}
 
@@ -161,7 +183,7 @@ func (c *chain) tryFinalizeTx(txID string, maxTSLocal uint64, crossChannels []st
 	finalTS := maxTSLocal
 
 	if len(crossChannels) > 1 {
-		// TODOS OS NÓS FAZEM POLLING DE TODOS OS OUTROS
+		// ALL-TO-ALL: Faz polling de todos os nós participantes (ignora os de fora)
 		for _, outroCanal := range crossChannels {
 			if outroCanal == c.channelID {
 				continue
@@ -201,18 +223,13 @@ func (c *chain) tryFinalizeTx(txID string, maxTSLocal uint64, crossChannels []st
 		}
 	}
 
-	// Como todos varreram a rede e aplicaram o MAX sobre os mesmos números locais,
-	// a matemática garante que todos chegaram ao mesmo FinalTS.
-	// Não precisamos de /commit. Vamos direto para o disco!
 	fmt.Printf("🔄 [ALL-TO-ALL Shard %s] CONSENSO INDEPENDENTE ATINGIDO: %s | TS Final: %d\n", c.channelID, txID, finalTS)
-
 	c.FinalizeAndDeliver(txID, finalTS)
 }
 
 func (c *chain) FinalizeAndDeliver(txID string, finalTS uint64) {
 	c.mutex.Lock()
 
-	// 🚨 CORREÇÃO ALGORITMO 1 (LINHA 16): Sincronização do Relógio de Lamport
 	if finalTS > c.lamportClock {
 		c.lamportClock = finalTS
 		fmt.Printf("⏱️ [SYNC] Shard %s adiantou o relógio interno para %d\n", c.channelID, c.lamportClock)
@@ -237,8 +254,16 @@ func (c *chain) FinalizeAndDeliver(txID string, finalTS uint64) {
 	for _, batch := range batches {
 		blocoSkeen := c.support.CreateNextBlock(batch)
 		c.support.WriteBlock(blocoSkeen, nil)
-		fmt.Printf("[SKEEN Canal %s] 🧱 *** BLOCO [%d] GRAVADO NO DISCO (Lote cheio: %d txs) ***\n", c.channelID, blocoSkeen.Header.Number, len(batch))
+
+		// 🚨 MÉTRICA REAL PARA A TESE 🚨
+		metricsMutex.Lock()
+		decorrido := time.Since(startTime).Seconds()
+		tpsReal := float64(txCount) / decorrido
+		fmt.Printf("\n[MÉTRICA SKEEN %s] 🧱 Bloco %d Gravado | Total Txs: %d | Tempo: %.2fs | TPS REAL: %.2f\n\n",
+			c.channelID, blocoSkeen.Header.Number, txCount, decorrido, tpsReal)
+		metricsMutex.Unlock()
 	}
+
 }
 
 // ==========================================
@@ -289,8 +314,6 @@ func startNetworkServer() {
 			"found":  found,
 		})
 	})
-
-	// Rota de /commit completamente removida. O consenso agora é 100% descentralizado.
 
 	fmt.Printf("[SKEEN NETWORK LAYER] API HTTP All-to-All ativa na porta: %d\n", skeenPort)
 	http.ListenAndServe(fmt.Sprintf(":%d", skeenPort), nil)
