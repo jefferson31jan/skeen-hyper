@@ -194,9 +194,6 @@ func (c *chain) tryFinalizeTx(txID string, maxTSLocal uint64, crossChannels []st
 			url := fmt.Sprintf("http://127.0.0.1:%d/skeen/exchange_ts", port)
 			reqData, _ := json.Marshal(map[string]interface{}{"tx_id": txID, "channel_id": outroCanal})
 
-			// 🟢 [FEEDBACK] LOG DA ETAPA 2 (Request)
-			fmt.Printf("📡 [FEEDBACK] Coordenador %s solicitando TS do %s via HTTP para Tx [%s]\n", c.channelID, outroCanal, txID)
-
 			// LOOP DE RETRY BLINDADO (Com verificação de "Found")
 			for i := 0; i < 15; i++ {
 				resp, err := http.Post(url, "application/json", bytes.NewBuffer(reqData))
@@ -207,10 +204,6 @@ func (c *chain) tryFinalizeTx(txID string, maxTSLocal uint64, crossChannels []st
 					}
 					if err := json.NewDecoder(resp.Body).Decode(&result); err == nil {
 						if result.Found {
-
-							// 🟢 [FEEDBACK] LOG DA ETAPA 3 (Resposta do Seguidor)
-							fmt.Printf("📩 [FEEDBACK] Coordenador %s recebeu TS Local: %d do %s para Tx [%s]\n", c.channelID, result.MaxTS, outroCanal, txID)
-
 							if result.MaxTS > finalTS {
 								finalTS = result.MaxTS
 							}
@@ -232,9 +225,6 @@ func (c *chain) tryFinalizeTx(txID string, maxTSLocal uint64, crossChannels []st
 	commitData, _ := json.Marshal(map[string]interface{}{
 		"tx_id": txID, "channel_id": c.channelID, "final_ts": finalTS,
 	})
-
-	// 🟢 [FEEDBACK] LOG DA ETAPA 5 (Aviso de Commit Global)
-	fmt.Printf("📢 [FEEDBACK] Coordenador %s enviando ordem de COMMIT Global para os seguidores na Tx [%s]\n", c.channelID, txID)
 
 	for _, ch := range crossChannels {
 		if ch == c.channelID {
@@ -319,11 +309,6 @@ func startNetworkServer() {
 			c.mutex.Unlock()
 		}
 
-		// 🟢 [FEEDBACK] LOG DA ETAPA 2 (Ouvinte/Seguidor processando o pedido)
-		if found {
-			fmt.Printf("📨 [FEEDBACK API] Shard %s respondendo solicitação de TS com valor %d para Tx [%s]\n", req.ChannelID, currentTS, req.TxID)
-		}
-
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"max_ts": currentTS,
@@ -337,9 +322,6 @@ func startNetworkServer() {
 			ChannelID string `json:"channel_id"` // Aqui ignoramos o channel_id do body, a URL já roteia certo
 		}
 		json.NewDecoder(r.Body).Decode(&msg)
-
-		// 🟢 [FEEDBACK] LOG DA ETAPA 5 (Ouvinte/Seguidor recebendo o veredito final)
-		fmt.Printf("✅ [FEEDBACK API] Shard(s) local(is) recebendo ordem de COMMIT Global do Coordenador para Tx [%s]\n", msg.TxID)
 
 		// Varre todos os canais locais (útil em ambientes multi-channel no mesmo nó)
 		globalRegistry.mutex.RLock()
