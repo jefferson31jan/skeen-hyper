@@ -121,8 +121,8 @@ type chain struct {
 func (c *chain) Configure(env *common.Envelope, configSeq uint64) error { return nil }
 func (c *chain) WaitReady() error                                       { return nil }
 func (c *chain) Errored() <-chan struct{}                               { return nil }
-func (c *chain) Start()                                                 { fmt.Printf("[SKEEN] Nó %s iniciado\n", c.channelID) }
-func (c *chain) Halt()                                                  {}
+func (c *chain) Start() { fmt.Printf("[SKEEN] Nó %s iniciado\n", c.channelID) }
+func (c *chain) Halt()  {}
 
 // ==========================================
 // GATILHO (Equivalente a Procedure multicast(m))
@@ -159,37 +159,8 @@ func (c *chain) Order(env *common.Envelope, configSeq uint64) error {
 	c.envelopes[txID] = env
 	c.mutex.Unlock()
 
-	// ==========================================
-	// 🚀 OTIMIZAÇÃO FAST-PATH (INTRA-SHARD)
-	// ==========================================
-	if len(dest) == 1 {
-		c.mutex.Lock()
-		c.clock++
-		tsFinal := c.clock
-		c.mutex.Unlock()
-
-		fmt.Printf("⏩ [FASE 0: FAST-PATH] Shard %s identificou Tx Intra-Shard [%s].\n", c.channelID, txID)
-		fmt.Printf("🎯 [CONSENSO LOCAL] Consenso Global = Consenso Local. TS Final definido como %d. Pulando rede Skeen!\n", tsFinal)
-
-		go c.deliverToFabric(txID)
-		return nil
-	}
-
-	// ==========================================
-	// 🌐 SKEEN ESTRITO (CROSS-SHARD)
-	// ==========================================
+	// Multicast(m): send (START, m) to m.dest
 	msg := SkeenMsg{Type: "START", TxID: txID, Dest: dest, Sender: c.channelID}
-
-	// Prepara a lista visual para não imprimir o próprio canal no log de envio
-	var remoteDest []string
-	for _, ch := range dest {
-		if ch != c.channelID {
-			remoteDest = append(remoteDest, ch)
-		}
-	}
-
-	fmt.Printf("📢 [FASE 1: GATILHO] Shard %s iniciando Skeen. Tx [%s] -> Processamento local e enviando START remoto para %v\n", c.channelID, txID, remoteDest)
-
 	go c.broadcast(dest, msg)
 
 	return nil
@@ -212,12 +183,6 @@ func (c *chain) handleMessage(msg SkeenMsg) {
 		ts := Timestamp{Clock: c.clock, Node: c.channelID}
 		c.local[msg.TxID] = ts
 
-		if msg.Sender == c.channelID {
-			fmt.Printf("📥 [FASE 2: START] Shard %s autogerou seu próprio TS local (Tx: %s). Relógio -> %d. Broadcast de LOCAL-TS.\n", c.channelID, msg.TxID, c.clock)
-		} else {
-			fmt.Printf("📥 [FASE 2: START] Shard %s recebeu START remoto de %s (Tx: %s). Relógio -> %d. Enviando LOCAL-TS.\n", c.channelID, msg.Sender, msg.TxID, c.clock)
-		}
-
 		reply := SkeenMsg{Type: "LOCAL-TS", TxID: msg.TxID, Dest: msg.Dest, Sender: c.channelID, TS: ts}
 		go c.broadcast(msg.Dest, reply)
 
@@ -230,14 +195,6 @@ func (c *chain) handleMessage(msg SkeenMsg) {
 
 		// Verifica se recebeu de ALL p in m.dest
 		if len(c.localTSRecv[msg.TxID]) == len(msg.Dest) {
-
-			// 📊 LOG DIDÁTICO: Mostra os votos recebidos
-			var votos []string
-			for node, ts := range c.localTSRecv[msg.TxID] {
-				votos = append(votos, fmt.Sprintf("%s: TS %d", node, ts.Clock))
-			}
-			fmt.Printf("📊 [FASE 3: APURAÇÃO] Shard %s recebeu os TS sugeridos para a Tx [%s] -> %v\n", c.channelID, msg.TxID, votos)
-
 			// final[m] <- maximum ts received for m
 			maxTS := Timestamp{Clock: 0, Node: ""}
 			for _, ts := range c.localTSRecv[msg.TxID] {
@@ -251,8 +208,6 @@ func (c *chain) handleMessage(msg SkeenMsg) {
 			if c.clock < maxTS.Clock {
 				c.clock = maxTS.Clock
 			}
-
-			fmt.Printf("⚖️ [FASE 3: CONSENSO] Shard %s consolidou TS da Tx [%s]. TS Final -> %d. Enviando ACK.\n", c.channelID, msg.TxID, maxTS.Clock)
 
 			c.tryDeliver()
 
@@ -270,7 +225,6 @@ func (c *chain) handleMessage(msg SkeenMsg) {
 
 		if len(c.ackRecv[msg.TxID]) == len(msg.Dest) {
 			c.acked[msg.TxID] = true
-			fmt.Printf("✅ [FASE 4: CONFIRMAÇÃO] Shard %s recebeu todos os ACKs da Tx [%s]. Status -> ACKED.\n", c.channelID, msg.TxID)
 			c.tryDeliver()
 		}
 	}
@@ -320,12 +274,10 @@ func (c *chain) tryDeliver() {
 
 		if canDeliver {
 			c.delivered[m] = true
-			fmt.Printf("🚀 [FASE 5: ENTREGA] Shard %s enviando Tx [%s] para o Fabric (Ordem Global Atingida! TS Definido: %d).\n", c.channelID, m, c.final[m].Clock)
 			go c.deliverToFabric(m) // deliver(m)
 		} else {
 			// Se o candidato com menor TS não pode ser entregue, a ordenação global
 			// exige que bloqueemos os subsequentes para garantir segurança (safety).
-			fmt.Printf("🛑 [HOL BLOCKING] Shard %s travou a fila na Tx [%s]. Aguardando resolução de TS mais antigos!\n", c.channelID, m)
 			break
 		}
 	}
@@ -367,7 +319,7 @@ func (c *chain) broadcast(dest []string, msg SkeenMsg) {
 	payload, _ := json.Marshal(msg)
 
 	for _, ch := range dest {
-		// Entrega local imediata (chama a função nativamente em vez de fazer requisição HTTP)
+		// Entrega local imediata
 		if ch == c.channelID {
 			c.handleMessage(msg)
 			continue
@@ -379,7 +331,7 @@ func (c *chain) broadcast(dest []string, msg SkeenMsg) {
 			continue
 		}
 		url := fmt.Sprintf("http://127.0.0.1:%d/skeen/msg", port)
-
+		
 		// Retentativa robusta para simular canal confiável
 		go func(url string, data []byte) {
 			for i := 0; i < 10; i++ {
@@ -430,14 +382,10 @@ func startNetworkServer() {
 
 func getPortForChannel(channelID string) int {
 	switch channelID {
-	case "canal1":
-		return 17050
-	case "canal2":
-		return 18050
-	case "canal3":
-		return 19050
-	case "canal4":
-		return 20050
+	case "canal1": return 17050
+	case "canal2": return 18050
+	case "canal3": return 19050
+	case "canal4": return 20050
 	}
 	return 0
 }
