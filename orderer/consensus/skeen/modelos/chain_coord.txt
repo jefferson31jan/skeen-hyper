@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net/http"
 	"os"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -19,12 +18,15 @@ import (
 // ==========================================
 // REGISTROS GLOBAIS E ESTRUTURAS
 // ==========================================
+const COORDENADOR_URL = "http://127.0.0.1:17050" // Canal 1 atua como Líder
+
 var (
 	startTime    time.Time
 	txCount      int
 	metricsMutex sync.Mutex
 )
 
+// Registro Global de Canais Locais
 type SkeenRegistry struct {
 	mutex  sync.RWMutex
 	chains map[string]*chain
@@ -35,6 +37,23 @@ var globalRegistry = &SkeenRegistry{
 }
 
 var serverOnce sync.Once
+
+// Estruturas do Coordenador (Apenas usadas pelo Canal 1)
+type CoordTxState struct {
+	ExpectedShards []string
+	ReceivedTS     map[string]uint64
+	FinalTS        uint64
+	IsReady        bool
+}
+
+var coordState = struct {
+	sync.RWMutex
+	txs map[string]*CoordTxState
+}{txs: make(map[string]*CoordTxState)}
+
+// ==========================================
+// INTEGRAÇÃO COM O FABRIC
+// ==========================================
 
 type skeenConsenter struct{}
 
@@ -88,7 +107,10 @@ func (c *chain) WaitReady() error                                       { return
 func (c *chain) Errored() <-chan struct{}                               { return nil }
 
 func (c *chain) Start() {
-	fmt.Printf("[SKEEN] Nó iniciado para o canal: %s\n", c.channelID)
+	fmt.Printf("[SKEEN COORD] Nó iniciado para o canal: %s\n", c.channelID)
+	if c.channelID == "canal1" {
+		fmt.Println("👑 [SKEEN COORD] Este nó é o COORDENADOR GLOBAL da rede!")
+	}
 }
 
 func (c *chain) Halt() {
@@ -102,7 +124,7 @@ func (c *chain) Halt() {
 func (c *chain) Order(env *common.Envelope, configSeq uint64) error {
 	metricsMutex.Lock()
 	if txCount == 0 {
-		startTime = time.Now() // Marca o início da rajada de testes
+		startTime = time.Now()
 	}
 	txCount++
 	metricsMutex.Unlock()
@@ -130,7 +152,7 @@ func (c *chain) Order(env *common.Envelope, configSeq uint64) error {
 		}
 	}
 
-	// 🚨 FIREWALL DE PROTEÇÃO (EDGE FILTERING) 🚨
+	// 🚨 FIREWALL DE PROTEÇÃO (EDGE FILTERING)
 	souParticipante := false
 	for _, ch := range crossChans {
 		if ch == c.channelID {
@@ -164,7 +186,7 @@ func (c *chain) Order(env *common.Envelope, configSeq uint64) error {
 	}
 	c.mutex.Unlock()
 
-	fmt.Printf("[SKEEN Canal %s] Tx [%s] recebida. TS: %d | Papel: PEER (All-to-All)\n", c.channelID, txID, meuTSLocal)
+	fmt.Printf("[SKEEN Canal %s] Tx [%s] recebida. TS: %d | Papel: PEER\n", c.channelID, txID, meuTSLocal)
 
 	if len(crossChans) > 1 {
 		go c.tryFinalizeTx(txID, meuTSLocal, crossChans)
@@ -176,54 +198,57 @@ func (c *chain) Order(env *common.Envelope, configSeq uint64) error {
 }
 
 // ==========================================
-// FASE 2: COORDENAÇÃO DESCENTRALIZADA (O(N^2))
+// FASE 2: COORDENAÇÃO CENTRALIZADA (O(N))
 // ==========================================
 
 func (c *chain) tryFinalizeTx(txID string, maxTSLocal uint64, crossChannels []string) {
 	finalTS := maxTSLocal
 
-	if len(crossChannels) > 1 {
-		// ALL-TO-ALL: Faz polling de todos os nós participantes (ignora os de fora)
-		for _, outroCanal := range crossChannels {
-			if outroCanal == c.channelID {
-				continue
-			}
+	// FASE 2.1: Enviar TS Local para o Coordenador
+	submitURL := fmt.Sprintf("%s/skeen/submit_ts", COORDENADOR_URL)
+	reqSubmit, _ := json.Marshal(map[string]interface{}{
+		"tx_id":           txID,
+		"channel_id":      c.channelID,
+		"ts_local":        maxTSLocal,
+		"expected_shards": crossChannels,
+	})
 
-			port := getPortForChannel(outroCanal)
-			if port == 0 {
-				continue
-			}
-
-			url := fmt.Sprintf("http://127.0.0.1:%d/skeen/exchange_ts", port)
-			reqData, _ := json.Marshal(map[string]interface{}{"tx_id": txID, "channel_id": outroCanal})
-
-			fmt.Printf("📡 [ALL-TO-ALL] Shard %s pedindo TS do %s para Tx [%s]\n", c.channelID, outroCanal, txID)
-
-			for i := 0; i < 15; i++ {
-				resp, err := http.Post(url, "application/json", bytes.NewBuffer(reqData))
-				if err == nil {
-					var result struct {
-						MaxTS uint64 `json:"max_ts"`
-						Found bool   `json:"found"`
-					}
-					if err := json.NewDecoder(resp.Body).Decode(&result); err == nil {
-						if result.Found {
-							fmt.Printf("📩 [ALL-TO-ALL] Shard %s recebeu TS: %d do %s para Tx [%s]\n", c.channelID, result.MaxTS, outroCanal, txID)
-							if result.MaxTS > finalTS {
-								finalTS = result.MaxTS
-							}
-							resp.Body.Close()
-							break
-						}
-					}
-					resp.Body.Close()
-				}
-				time.Sleep(time.Duration(20*(i+1)) * time.Millisecond)
-			}
+	fmt.Printf("📡 [COORDENADOR] Shard %s enviando TS %d ao Líder. Tx [%s]\n", c.channelID, maxTSLocal, txID)
+	
+	// Tenta enviar o TS até conseguir
+	for {
+		resp, err := http.Post(submitURL, "application/json", bytes.NewBuffer(reqSubmit))
+		if err == nil {
+			resp.Body.Close()
+			break
 		}
+		time.Sleep(10 * time.Millisecond)
 	}
 
-	fmt.Printf("🔄 [ALL-TO-ALL Shard %s] CONSENSO INDEPENDENTE ATINGIDO: %s | TS Final: %d\n", c.channelID, txID, finalTS)
+	// FASE 2.2: Fazer polling no Coordenador aguardando o Consenso Final
+	pollURL := fmt.Sprintf("%s/skeen/get_final_ts", COORDENADOR_URL)
+	reqPoll, _ := json.Marshal(map[string]interface{}{"tx_id": txID})
+
+	for i := 0; i < 50; i++ {
+		resp, err := http.Post(pollURL, "application/json", bytes.NewBuffer(reqPoll))
+		if err == nil {
+			var result struct {
+				FinalTS uint64 `json:"final_ts"`
+				Ready   bool   `json:"ready"`
+			}
+			if err := json.NewDecoder(resp.Body).Decode(&result); err == nil {
+				if result.Ready {
+					finalTS = result.FinalTS
+					fmt.Printf("📩 [COORDENADOR] Shard %s recebeu TS FINAL: %d do Líder. Tx [%s]\n", c.channelID, finalTS, txID)
+					resp.Body.Close()
+					break
+				}
+			}
+			resp.Body.Close()
+		}
+		time.Sleep(time.Duration(15*(i+1)) * time.Millisecond) // Backoff progressivo
+	}
+
 	c.FinalizeAndDeliver(txID, finalTS)
 }
 
@@ -255,7 +280,6 @@ func (c *chain) FinalizeAndDeliver(txID string, finalTS uint64) {
 		blocoSkeen := c.support.CreateNextBlock(batch)
 		c.support.WriteBlock(blocoSkeen, nil)
 
-		// 🚨 MÉTRICA REAL PARA A TESE 🚨
 		metricsMutex.Lock()
 		decorrido := time.Since(startTime).Seconds()
 		tpsReal := float64(txCount) / decorrido
@@ -263,7 +287,6 @@ func (c *chain) FinalizeAndDeliver(txID string, finalTS uint64) {
 			c.channelID, blocoSkeen.Header.Number, txCount, decorrido, tpsReal)
 		metricsMutex.Unlock()
 	}
-
 }
 
 // ==========================================
@@ -275,60 +298,95 @@ func startNetworkServer() {
 	if fabricPortStr == "" {
 		fabricPortStr = "7050"
 	}
-	fabricPort, _ := strconv.Atoi(fabricPortStr)
-	skeenPort := fabricPort + 10000
+	// A API roda na porta do Fabric + 10000 (ex: 17050)
+	skeenPort := fabricPortStr + "0" 
+	if fabricPortStr == "7050" {
+		skeenPort = "17050"
+	} else if fabricPortStr == "8050" {
+		skeenPort = "18050"
+	} else if fabricPortStr == "9050" {
+		skeenPort = "19050"
+	} else if fabricPortStr == "10050" {
+		skeenPort = "20050"
+	}
 
-	http.HandleFunc("/skeen/exchange_ts", func(w http.ResponseWriter, r *http.Request) {
+	// ROTA 1: Receber Timestamps Locais (Executado APENAS pelo Coordenador)
+	http.HandleFunc("/skeen/submit_ts", func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
-			TxID      string `json:"tx_id"`
-			ChannelID string `json:"channel_id"`
+			TxID           string   `json:"tx_id"`
+			ChannelID      string   `json:"channel_id"`
+			TSLocal        uint64   `json:"ts_local"`
+			ExpectedShards []string `json:"expected_shards"`
 		}
 		json.NewDecoder(r.Body).Decode(&req)
 
-		globalRegistry.mutex.RLock()
-		c, exists := globalRegistry.chains[req.ChannelID]
-		globalRegistry.mutex.RUnlock()
-
-		var currentTS uint64 = 0
-		found := false
-
-		if exists {
-			c.mutex.Lock()
-			if tx, ok := c.pendingQueue[req.TxID]; ok {
-				currentTS = tx.TSLocal
-				found = true
-			} else if histTS, ok := c.localTSHistory[req.TxID]; ok {
-				currentTS = histTS
-				found = true
+		coordState.Lock()
+		state, exists := coordState.txs[req.TxID]
+		if !exists {
+			state = &CoordTxState{
+				ExpectedShards: req.ExpectedShards,
+				ReceivedTS:     make(map[string]uint64),
+				FinalTS:        0,
+				IsReady:        false,
 			}
-			c.mutex.Unlock()
+			coordState.txs[req.TxID] = state
 		}
 
-		if found {
-			fmt.Printf("📨 [FEEDBACK API] Shard %s devolvendo TS %d para quem pediu. Tx [%s]\n", req.ChannelID, currentTS, req.TxID)
+		// Registra o TS recebido deste Shard
+		state.ReceivedTS[req.ChannelID] = req.TSLocal
+
+		// Verifica se já recebeu de todos os Shards envolvidos na Tx
+		allReceived := true
+		for _, expected := range state.ExpectedShards {
+			if _, ok := state.ReceivedTS[expected]; !ok {
+				allReceived = false
+				break
+			}
+		}
+
+		// Se recebeu de todos, calcula o máximo e finaliza
+		if allReceived && !state.IsReady {
+			var max uint64 = 0
+			for _, ts := range state.ReceivedTS {
+				if ts > max {
+					max = ts
+				}
+			}
+			state.FinalTS = max
+			state.IsReady = true
+			fmt.Printf("👑 [LÍDER] Consenso atingido para Tx [%s]. TS Máximo: %d\n", req.TxID, max)
+		}
+		coordState.Unlock()
+
+		w.WriteHeader(http.StatusOK)
+	})
+
+	// ROTA 2: Consultar TS Final (Executado APENAS pelo Coordenador)
+	http.HandleFunc("/skeen/get_final_ts", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			TxID string `json:"tx_id"`
+		}
+		json.NewDecoder(r.Body).Decode(&req)
+
+		coordState.RLock()
+		state, exists := coordState.txs[req.TxID]
+		coordState.RUnlock()
+
+		ready := false
+		var finalTS uint64 = 0
+
+		if exists && state.IsReady {
+			ready = true
+			finalTS = state.FinalTS
 		}
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"max_ts": currentTS,
-			"found":  found,
+			"final_ts": finalTS,
+			"ready":    ready,
 		})
 	})
 
-	fmt.Printf("[SKEEN NETWORK LAYER] API HTTP All-to-All ativa na porta: %d\n", skeenPort)
-	http.ListenAndServe(fmt.Sprintf(":%d", skeenPort), nil)
-}
-
-func getPortForChannel(channelID string) int {
-	switch channelID {
-	case "canal1":
-		return 17050
-	case "canal2":
-		return 18050
-	case "canal3":
-		return 19050
-	case "canal4":
-		return 20050
-	}
-	return 0
+	fmt.Printf("[SKEEN NETWORK LAYER] API HTTP do Coordenador ativa na porta: %s\n", skeenPort)
+	http.ListenAndServe(":"+skeenPort, nil)
 }
